@@ -1,0 +1,43 @@
+{
+  "name": "dsh-ai-ball",
+  "version": "0.1.0",
+  "description": "Give the agent a mouth: speak through the ai-ball floating orb (monologue, mood, listening).",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "dsh": ">=0.1.0-rc.6"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "ai-ball",
+    "overlay",
+    "avatar"
+  ],
+  "author": "Hyfwdnmd666",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hyfwdnmd666/dsh-ai-ball.git"
+  },
+  "homepage": "https://github.com/Hyfwdnmd666/dsh-ai-ball#readme",
+  "bugs": {
+    "url": "https://github.com/Hyfwdnmd666/dsh-ai-ball/issues"
+  },  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
