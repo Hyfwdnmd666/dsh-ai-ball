@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-ai-ball
+      name: dsh-ai-ball
+      config: {}
