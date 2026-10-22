@@ -70,9 +70,24 @@ function assertLosslessJson(value, path = 'result') {
   walk(value, path);
 }
 
-/** Run a tool and also exercise its render(), which the host always calls. */
-async function call(tool, args = {}) {
-  const value = await tool.execute(args);
+/** A stand-in for the calling Agent: we only care that followup() got the words. */
+function fakeAgent() {
+  const delivered = [];
+  return {
+    delivered,
+    followup(message) { delivered.push(message); },
+  };
+}
+
+/**
+ * Run a tool and also exercise its render(), which the host always calls.
+ *
+ * `agent` is passed the way the host does — as `exec.agent` on a tool execution
+ * (dsh-tools declares `readonly agent?: Agent` there), which is how the plugin learns whose
+ * mouth the ball is.
+ */
+async function call(tool, args = {}, agent = null) {
+  const value = await tool.execute(args, { agent });
   assertLosslessJson(value, `${tool.name} result`);
   const rendered = tool.output.render(args, value);
   assert.ok(Array.isArray(rendered), `${tool.name}: render must return an array`);
@@ -82,6 +97,8 @@ async function call(tool, args = {}) {
   }
   return { value, text: rendered.map((b) => b.text).join('\n') };
 }
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const read = (p) => fs.readFileSync(p, 'utf8');
 
@@ -341,6 +358,171 @@ test('ball_panel rejects a non-boolean rather than guessing', async () => {
   await assert.rejects(() => byName.ball_panel.execute({ visible: 'yes' }), /visible must be true or false/);
 });
 
+// ---------------------------------------------------------------- the listening half
+
+test('what the human types reaches the agent as a real user message', async () => {
+  // The whole point. Polling made the ball a stage: the agent only heard you if it happened
+  // to call ball_listen. The watcher pushes instead, via agent.followup(), whose contract is
+  // "queue an ordinary follow-up turn and wake the driver".
+  const dir = freshBallDir();
+  const agent = fakeAgent();
+  const app = mount({ ballDir: dir, heartbeatMs: 40, followMs: 30 });
+  try {
+    // No agent yet: the plugin cannot know whose mouth the ball is until a tool runs.
+    fs.appendFileSync(path.join(dir, 'input.log'), '左边那个骑兵别追\n', 'utf8');
+    await wait(120);
+    assert.deepEqual(agent.delivered, [], 'delivered before it knew the agent');
+
+    // Any ball tool teaches it.
+    await call(app.byName.ball_mood, { mood: 'nervous' }, agent);
+    await wait(150);
+
+    assert.equal(agent.delivered.length, 1, 'the typed line never arrived');
+    const m = agent.delivered[0];
+    assert.equal(m.role, 'user');
+    assert.equal(m.content[0].text, '左边那个骑兵别追');
+    // `user`, not `plugin`: the human really did type it, just through an orb. It is also
+    // what the host's own prompt injection uses, so it cannot be treated as a stranger.
+    assert.equal(m.source.kind, 'user');
+  } finally {
+    app.dispose();
+  }
+});
+
+test('each line is delivered once and only once', async () => {
+  const dir = freshBallDir();
+  const agent = fakeAgent();
+  const app = mount({ ballDir: dir, heartbeatMs: 40, followMs: 30 });
+  try {
+    await call(app.byName.ball_status, {}, agent);
+    await wait(60);
+    fs.appendFileSync(path.join(dir, 'input.log'), '第一句\n', 'utf8');
+    await wait(120);
+    fs.appendFileSync(path.join(dir, 'input.log'), '第二句\n', 'utf8');
+    await wait(150);
+    assert.deepEqual(
+      agent.delivered.map((m) => m.content[0].text),
+      ['第一句', '第二句'],
+    );
+  } finally {
+    app.dispose();
+  }
+});
+
+test('input typed while the agent is unknown is not lost', async () => {
+  // It has to survive until the plugin learns who to give it to, or the first thing a
+  // human says after a restart disappears.
+  const dir = freshBallDir();
+  const agent = fakeAgent();
+  const app = mount({ ballDir: dir, heartbeatMs: 40, followMs: 30 });
+  try {
+    fs.appendFileSync(path.join(dir, 'input.log'), '在吗\n', 'utf8');
+    await wait(100);
+    assert.deepEqual(agent.delivered, []);
+    await call(app.byName.ball_mood, { mood: 'smug' }, agent);
+    await wait(150);
+    assert.equal(agent.delivered[0].content[0].text, '在吗');
+  } finally {
+    app.dispose();
+  }
+});
+
+test('a delivery failure is retried, not eaten', async () => {
+  // Losing what a human typed is the one outcome worth extra code for. A throw must leave
+  // the line unconsumed so the next tick picks it up again — which is why this asserts the
+  // RETRY rather than the rollback: the rollback's whole purpose is the retry that follows.
+  const dir = freshBallDir();
+  const flaky = {
+    attempts: 0,
+    ok: [],
+    followup(message) {
+      this.attempts += 1;
+      if (this.attempts === 1) throw new Error('driver busy');
+      this.ok.push(message);
+    },
+  };
+  const app = mount({ ballDir: dir, heartbeatMs: 40, followMs: 30 });
+  try {
+    await call(app.byName.ball_mood, { mood: 'smug' }, flaky);
+    fs.appendFileSync(path.join(dir, 'input.log'), '别丢了我\n', 'utf8');
+    await wait(250);
+    assert.ok(flaky.attempts >= 2, `never retried (${flaky.attempts} attempt(s))`);
+    assert.equal(flaky.ok.length, 1, `delivered ${flaky.ok.length} times, expected once`);
+    assert.equal(flaky.ok[0].content[0].text, '别丢了我');
+  } finally {
+    app.dispose();
+  }
+});
+
+test('followInput: false goes back to polling', async () => {
+  const dir = freshBallDir();
+  const agent = fakeAgent();
+  const app = mount({ ballDir: dir, heartbeatMs: 40, followMs: 30, followInput: false });
+  try {
+    await call(app.byName.ball_mood, { mood: 'smug' }, agent);
+    fs.appendFileSync(path.join(dir, 'input.log'), '只有轮询能看见我\n', 'utf8');
+    await wait(150);
+    assert.deepEqual(agent.delivered, [], 'delivered even though followInput is off');
+    const { value } = await call(app.byName.ball_listen);
+    assert.deepEqual(value.lines, ['只有轮询能看见我']);
+    assert.equal(value.following, false);
+  } finally {
+    app.dispose();
+  }
+});
+
+test('dispose stops the watcher', async () => {
+  const dir = freshBallDir();
+  const agent = fakeAgent();
+  const app = mount({ ballDir: dir, heartbeatMs: 40, followMs: 30 });
+  await call(app.byName.ball_mood, { mood: 'smug' }, agent);
+  app.dispose();
+  fs.appendFileSync(path.join(dir, 'input.log'), '关了就别送了\n', 'utf8');
+  await wait(150);
+  assert.deepEqual(agent.delivered, []);
+});
+
+test('ball_status says why listening is not working', async () => {
+  // "Listening silently does nothing" is the exact bug this feature exists to fix, so the
+  // diagnostic has to be in the tool rather than in a host log nobody can open.
+  const dir = freshBallDir();
+  const agent = fakeAgent();
+  const app = mount({ ballDir: dir, heartbeatMs: 40, followMs: 30 });
+  try {
+    // Before any tool runs, the plugin cannot know whose mouth the ball is.
+    const before = await call(app.byName.ball_status);
+    assert.equal(before.value.following, true);
+    assert.equal(before.value.agent_known, false);
+    assert.match(before.text, /no agent has called a ball tool yet/);
+
+    await call(app.byName.ball_mood, { mood: 'smug' }, agent);
+    const after = await call(app.byName.ball_status, {}, agent);
+    assert.equal(after.value.agent_known, true);
+    assert.match(after.text, /listening: on/);
+  } finally {
+    app.dispose();
+  }
+});
+
+test('ball_status reports a delivery error instead of swallowing it', async () => {
+  const dir = freshBallDir();
+  const broken = {
+    followup() { throw new Error('no such inbox boundary'); },
+  };
+  const app = mount({ ballDir: dir, heartbeatMs: 40, followMs: 30 });
+  try {
+    await call(app.byName.ball_mood, { mood: 'smug' }, broken);
+    fs.appendFileSync(path.join(dir, 'input.log'), '送不出去\n', 'utf8');
+    await wait(150);
+    const { value, text } = await call(app.byName.ball_status, {}, broken);
+    assert.equal(value.follow_error, 'no such inbox boundary');
+    assert.match(text, /listening ERROR: no such inbox boundary/);
+    assert.equal(value.delivered, 0);
+  } finally {
+    app.dispose();
+  }
+});
+
 // ---------------------------------------------------------------- ball_status
 
 test('ball_status reports the wiring when configured', async () => {
@@ -362,12 +544,55 @@ test('ball_status reports the wiring when configured', async () => {
 });
 
 test('ball_status says so when nothing is writing status.json', async () => {
-  const { byName } = mount({ ballDir: freshBallDir() });
-  const { value, text } = await call(byName.ball_status, {});
-  assert.equal(value.configured, true);
-  // -1, not NaN: the host refuses non-lossless JSON and NaN passes every typeof test.
-  assert.equal(value.heartbeat_age_s, -1);
-  assert.match(text, /no heartbeat yet/);
+  const dir = freshBallDir();
+  const app = mount({ ballDir: dir, heartbeatMs: 40 });
+  try {
+    // The plugin beats from load now, so "nothing is writing" has to be made true by hand.
+    // It is still the case that matters: the orb renders grey and the note has to say why
+    // rather than blame a mood nobody set.
+    fs.unlinkSync(path.join(dir, 'status.json'));
+    const { value, text } = await call(app.byName.ball_status);
+    assert.equal(value.configured, true);
+    // -1, not NaN: the host refuses non-lossless JSON and NaN passes every typeof test.
+    assert.equal(value.heartbeat_age_s, -1);
+    assert.match(text, /no heartbeat yet/);
+  } finally {
+    app.dispose();
+  }
+});
+
+test('the plugin beats from load instead of waiting for a mood call', async () => {
+  // Otherwise the orb sits grey until somebody happens to set a mood, which reads as "the
+  // plugin did nothing".
+  const dir = freshBallDir();
+  const app = mount({ ballDir: dir, heartbeatMs: 40 });
+  try {
+    const status = JSON.parse(read(path.join(dir, 'status.json')));
+    assert.equal(typeof status.alive, 'number');
+    await wait(150);
+    assert.ok(
+      JSON.parse(read(path.join(dir, 'status.json'))).alive > status.alive,
+      'the heartbeat did not keep running',
+    );
+  } finally {
+    app.dispose();
+  }
+});
+
+test('beating at load keeps a mood that is already in the file', async () => {
+  // Loading the plugin must not stomp a game mod's face.
+  const dir = freshBallDir();
+  fs.writeFileSync(
+    path.join(dir, 'status.json'),
+    JSON.stringify({ alive: Date.now() / 1000, mood: 'smug' }),
+    'utf8',
+  );
+  const app = mount({ ballDir: dir, heartbeatMs: 40 });
+  try {
+    assert.equal(JSON.parse(read(path.join(dir, 'status.json'))).mood, 'smug');
+  } finally {
+    app.dispose();
+  }
 });
 
 test('ball_status flags a stale heartbeat as the reason the orb looks grey', async () => {
