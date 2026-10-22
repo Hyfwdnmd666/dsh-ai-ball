@@ -36,6 +36,8 @@ dsh plugin --profile web add link:/path/to/dsh-ai-ball
     startCommand: C:\tools\ai-ball\start.bat   # 可选：ball_launch 用
     cps: 50                          # 可选：球的打字速度，用来估算 wait
     heartbeatMs: 3000                # 可选：心跳间隔，必须小于球那边的 stale_s
+    followInput: true                # 可选：你在球里打的字直接变成 agent 的消息
+    followMs: 700                    # 可选：input.log 的轮询间隔
     files:                           # 可选：和球自己的 config.json 对齐
       monologue: monologue.log
       input: input.log
@@ -47,6 +49,31 @@ dsh plugin --profile web add link:/path/to/dsh-ai-ball
 **`ballDir` 故意没有默认值。** 猜别人把球解压到哪儿了，正是插件往错目录里写文件的方式 ——
 所以它宁可报一个说清楚哪里不对的错。
 
+## 听，才是"交互"
+
+**只写不读的球是个牵线木偶**：agent 说话、你看着，然后没有下文。
+
+而"我轮询一下看看你说没说话"也不算交互 —— agent 只有**碰巧想起来**调 `ball_listen` 才听得到你。
+你没被听见的时候，你打进去的字就进了 `input.log` 这个黑洞。
+
+所以默认开着 `followInput`：**插件自己盯着 `input.log`，把每一行当成一条真正的用户消息
+交给 agent**（`agent.followup()`，它的契约原话是"排一个普通的后续回合并唤醒驱动器 ——
+这条目自成其回合的唯一一条普通消息"）。**你在球里打字，等于你发了条消息。**
+
+三个细节：
+
+- **agent 是"学"来的。** 插件层的上下文里没有 agent；`exec.agent` 只在工具调用时才出现。
+  所以插件在**任何一个球工具第一次被调用时**才知道该把话送给谁。在那之前的输入**不会丢**，
+  会等它认领。
+- **投递失败会重试，不会吃掉你的话。** 送不出去就把游标退回去，下一拍再送。
+- **监听器和 `ball_listen` 共用同一个读取游标。** 两个游标会让同一句话被消费两次
+  （一次当消息、一次当工具结果）。所以开着 `followInput` 时 `ball_listen` 通常返回空 ——
+  **那是成功，不是沉默**，话已经以消息的形式到了。
+
+> ⚠️ **`brain.py` 也读 `input.log`。** 两个读者 = 两个回复。想要球只当 DSH 的嘴，
+> 就别跑 `brain.py`（插件从加载起就接管心跳，球不会因此变灰）。想让它自己聊天，
+> 就把 `followInput` 关掉。
+
 ## 六个工具
 
 | 工具 | 作用 |
@@ -54,7 +81,7 @@ dsh plugin --profile web add link:/path/to/dsh-ai-ball
 | `ball_say` | 说话。追加到 `monologue.log`，球逐字念出来。`clear=true` 先清屏 |
 | `ball_mood` | 改球的脸：`idle` / `thinking` / `nervous` / `smug` / `broken` |
 | `ball_panel` | 显示 / 收起独白面板 |
-| `ball_listen` | 读你在球里打的字（`input.log`），只返回新的 |
+| `ball_listen` | 手动读 `input.log`。**开着 `followInput` 时通常返回空**（话已经作为消息送来了）|
 | `ball_status` | 报告接线情况：文件大小、最后说了什么、心跳多旧、有没有在心跳 |
 | `ball_launch` | 按配置的 `startCommand` 把球拉起来 |
 
